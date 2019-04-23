@@ -1,0 +1,199 @@
+---
+title: "Calculating MMRates from DHS survey data"
+author: "Evan Brand"
+date: "4/23/2019"
+output: html_document
+---
+
+## Introduction
+
+The following is a method of calculating age-disaggregated maternal mortality rates (MMRates) from DHS survey data in R. The DHS estimates MMRates using the sisterhood method, by which individual women are asked for information about their sisters. The sisters are the units of analysis for maternal mortality calculations.
+
+The information we'll need is:
+
+* Sisters' dates of birth
+* Deceased sisters' dates of death
+* Whether deceased sisters had a pregnancy-related death
+
+The libraries we need for data import and wrangling: 
+
+```{r message=F, warning=F}
+library(tidyverse)
+library(haven)
+```
+
+## Getting the data in
+
+This example uses the DHS VI model data, which are synthetic data created to look like real DHS microdata. We need the individual recode, which contains one record for each women interviewed. (Note: the ZZIR62FL.dta file is not included in the repo for this tutorial but can be downloaded [here](https://dhsprogram.com/data/Download-Model-Datasets.cfm).)
+
+```{r eval=FALSE}
+women = read_dta("ZZIR62FL.dta")
+```
+
+Each interviewed woman's siblings are recorded in different columns. There are twenty copies of each sibling variable in order to allow plenty of space to record data for all siblings. For example, the sibling survival status variable is `mm2` so the dataset contains columns `mm2_01`, `mm2_02`, ..., `mm2_20`.
+
+The first step is to select the variables we'll need. Sampling weights are recorded without a decimal so they need to be divided by 1,000,000 before we use them:
+
+```{r eval=FALSE}
+mmrate_data = select(women,
+                  caseid,
+                  weight = v005,
+                  int_date = v008,
+                  starts_with("mmidx_"),
+                  starts_with("mm1_"),
+                  starts_with("mm2_"),
+                  starts_with("mm4_"),
+                  starts_with("mm8_"),
+                  starts_with("mm9_"))
+mmrate_data$weight = mmrate_data$weight / 1000000
+```
+
+It's helpful to convert the categorical variables from labelled Stata variables to R factor variables so we can work with the level labels directly:
+
+```{r eval=FALSE}
+mmrate_data = mmrate_data %>%
+  mutate_at(vars(starts_with("mm1_"),
+                 starts_with("mm2_"),
+                 starts_with("mm9_")),
+            as_factor)
+```
+
+## Reshaping the data
+
+Now we need to reshape the data so that each observation is a sibling. We can reshape with the following pipe:
+
+```{r eval=FALSE}
+mmrate_data = mmrate_data %>%
+  gather(key, value, starts_with("mm")) %>%
+  separate(key, c("variable", "sib_num"), "_") %>%
+  spread(variable, value, convert=T)
+```
+
+`gather` gathers all the `mm` variable names into a `key` column, `separate` splits this column at the underscore into the root of the variable name (e.g., `mm9`) and the sibling number suffix, and `spread` maps the variable name roots back to columns. 
+
+Next we'll give our variables more descriptive names and keep only female siblings whose survival status is known.
+
+```{r eval=FALSE}
+mmrate_data = mmrate_data %>%
+  rename(sex = mm1,
+         alive = mm2,
+         birth_date = mm4,
+         death_date = mm8,
+         maternal_death = mm9) %>%
+  filter(sex == "female",
+         alive %in% c("alive", "dead"))
+```
+
+Here is how the data look now (first 10 rows):
+
+```{r echo=FALSE}
+mmrate_data = read.csv("mmrate_data.csv")
+```
+
+```{r}
+knitr::kable(head(mmrate_data, 10))
+```
+
+## Calculating time spent in (up to) three age groups
+
+Calculating the numerator for the MMRate is straightforward: number of maternal deaths in each age group in the past seven years. Calculation of the denominator, person-years of “exposure”, is more complicated. In effect, this is asking the question: in the past seven years, how many years did all women collectively spend in each (five-year) age group?
+
+It's possible for women to have spent time in up to three age groups in the past seven years. For example, if a women was 36 at the time she was interviewed, she spent time in the 25-29, 30-34 and 35-39 age groups in the past seven years. In other words, she had “exposure” to each of those age groups. So we will create six variables to calculate exposure:
+
+* `last_age_group`: a variable to store the age group a woman currently belongs to (at the time of interview) or died in if she died in the past seven years
+* `mid_age_group`: a variable to store the age group below a woman’s current age group or the age group she died in
+* `first_age_group`: a variable to store two age groups below a woman’s current age group or the age group she died in - i.e., the first age group she could have been exposed to.
+* `expo_1`: the amount of time, in months, a woman spent in last_age_group in the past seven years
+* `expo_2`: the amount of time, in months, a woman spent in mid_age_group in the past seven years
+* `expo_3`: the amount of time, in months, a woman spent in first_age_group in the past seven years (will be zero for surviving women who only spent time in two age groups in the past seven years)
+
+We'll record age groups as 0 for 0-4, 1 for 5-9, 2 for 10-14, etc. Since `last_age_group` is the age group of death for deceased women, we will also count number of deaths in `last_age_group`.
+
+The first step is to calculate total exposure during the last seven years. For surviving females older than 7 years old, this will be 84 months (DHS stores dates as century month codes, so we'll be working in months for now). For women who have died, this will be the amount of time they were alive during the past seven years before they died. For sisters younger than 7 years old, this will be their age in months - though sisters younger than 15 years old at the time of interview/death will be filtered out eventually anyway.
+
+```{r}
+mmrate_data = mmrate_data %>%
+  mutate(
+    upper_lim = pmin(int_date - 1, death_date, na.rm = T),
+    lower_lim = pmax(int_date - 84, birth_date),
+    total_exposure = upper_lim - lower_lim + 1
+    ) %>%
+  filter(total_exposure > 0)
+```
+
+We'll add the age group and exposure variables as follows:
+
+* `last_age_group`: floor((`upper_lim` - `birth_date`) / 60), which evaluates to 0 for sisters aged 0-4 at the time of interview/death, 1 for sisters aged 5-9 at the time of interview/death, etc.
+* `mid_age_group`: `last_age_group` - 1
+* `first_age_group`: `mid_age_group` - 1
+* `expo_1`: the minimum of `total_exposure` and `upper_lim` - (`birth_date` + `last_age_group` * 60) + 1). The latter is the number of months between time of interview/death and when the woman entered her current age group - `total_exposure` will be less than this for deceased women who died shortly after seven years ago so we take the minimum of the two.
+* `expo_2`: the minimum of 60 and `total_exposure` - `expo_1` - either a woman spanned the entire middle age group in the past seven years, which is 60 months wide, or she didn't and her remaining exposure, `total_exposure` - `expo_1`, is less and all gets allocated to the middle group.
+* `expo_3`: `total_exposure` - `expo_1` - `expo_2` - whatever remains, if anything, after exposure has been allocated to the first two age groups.
+
+We'll also collapse the levels of `maternal_death` that are considered pregnancy-related deaths.
+
+```{r warning=F}
+mmrate_data = mmrate_data %>% 
+  mutate(
+    last_age_group = floor((upper_lim - birth_date) / 60),
+    mid_age_group = last_age_group - 1,
+    first_age_group = mid_age_group - 1,
+    expo_1 = pmin(total_exposure,
+                  upper_lim - (birth_date + last_age_group * 60) + 1),
+    expo_2 = pmin(60, total_exposure - expo_1),
+    expo_3 = total_exposure - expo_1 - expo_2,
+    maternal_death = fct_collapse(maternal_death,
+                                  "pregnancy-related" = c("died while pregnant",
+                                                          "died during delivery",
+                                                          "since delivery",
+                                                          "6 weeks after delivery",
+                                                          "2 months after delivery")
+                                  )
+    )
+```
+
+Now we'll summarize weighted exposure by age group, keeping only age groups 3-9 (15-19 to 45-49). We need to summarize weighted pregnancy-related deaths by `last age group` since this was the age group of death for deceased sisters.
+
+```{r}
+last_age_sums = mmrate_data %>% 
+  group_by(last_age_group) %>%
+  summarize(
+    total_exp_1 = sum(weight * expo_1 / 12),
+    total_deaths = sum(weight * (maternal_death == "pregnancy-related"),
+                       na.rm=T)) %>%
+  filter(last_age_group %in% 3:9)
+mid_age_sums = mmrate_data %>%
+  group_by(mid_age_group) %>%
+  summarize(
+    total_exp_2 = sum(weight * expo_2 / 12)) %>%
+  filter(mid_age_group %in% 3:9)
+first_age_sums = mmrate_data %>%
+  group_by(first_age_group) %>%
+  summarize(
+    total_exp_3 = sum(weight * expo_3 / 12)) %>%
+  filter(first_age_group %in% 3:9)
+```
+
+The last step is to stitch together the three exposure tables and calculate maternal mortality rates.
+
+```{r}
+mmrate = last_age_sums %>%
+  transmute(age_group = paste(last_age_group * 5, "-",
+                              (last_age_group + 1) * 5 - 1,
+                              sep = ""),
+            maternal_deaths = total_deaths,
+            exposure_years = total_exp_1 +
+                              mid_age_sums$total_exp_2 +
+                              first_age_sums$total_exp_3,
+            maternal_mortality_rate = 1000 * maternal_deaths / exposure_years)
+```
+
+The final table, `mmrate`:
+
+```{r echo=FALSE}
+mmrate %>%
+  mutate_if(is.numeric, round, 1) %>%
+  knitr::kable()
+```
+
+This table matches the maternal mortality rate table for the model data provided by DHS. It also illustrates how maternal mortality rates fail to control for differences in fertility across groups - MMRates trail off for older age groups mostly just because pregnancies are less common in those age groups.
